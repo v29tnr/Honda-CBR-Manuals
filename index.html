@@ -348,6 +348,25 @@
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: #111; }
     ::-webkit-scrollbar-thumb { background: #5a5a8a; border-radius: 3px; }
+
+    /* ── Mobile ──────────────────────────────────────────────── */
+    @media (pointer: coarse), (max-width: 600px) {
+      /* Hide in-viewport nav arrows — use swipe instead */
+      .vp-nav { display: none !important; }
+
+      /* Sidebar hidden by default on mobile */
+      #sidebar { display: none; }
+
+      /* Compact header */
+      .title { display: none; }
+      .sep   { display: none; }
+      header { gap: 0.25rem; padding: 0 0.3rem; }
+      button { padding: 0.28rem 0.5rem; font-size: 0.78rem; }
+      #pageInput { width: 2.6rem; }
+
+      /* Full-width viewport padding */
+      #viewport { padding: 0.4rem; }
+    }
   </style>
 </head>
 <body>
@@ -426,7 +445,8 @@
   let pdfDoc        = null;
   let currentPage   = 1;
   let currentScale  = 'auto';
-  let sidebarVisible = true;
+  const _mobileInit   = window.matchMedia('(pointer: coarse), (max-width: 600px)').matches;
+  let sidebarVisible  = !_mobileInit;
   let searchIndexed  = false;
   let activeRender   = null;
   let highlightQuery = null;
@@ -442,6 +462,7 @@
   const totalSpan     = document.getElementById('totalPages');
   const zoomSelect    = document.getElementById('zoomSelect');
   const sidebar       = document.getElementById('sidebar');
+  if (!sidebarVisible) sidebar.style.display = 'none';
   const viewport_el   = document.getElementById('viewport');
   const overlay       = document.getElementById('loadingOverlay');
   const loadingText   = document.getElementById('loadingText');
@@ -456,8 +477,10 @@
     const pad    = 32;
     const availW = viewport_el.clientWidth  - pad;
     const availH = viewport_el.clientHeight - pad;
-    // Subtract nav button widths (~50px each) from available width
-    const availWBook = availW - 110;
+    // On touch/mobile the vp-nav buttons are hidden, so don't subtract their width
+    var isMobile = window.matchMedia('(pointer: coarse), (max-width: 600px)').matches;
+    var navW = isMobile ? 0 : 110;
+    const availWBook = availW - navW;
     switch (currentScale) {
       case 'auto': return Math.min(availWBook / raw.width, availH / raw.height);
       case 'fitw': return availWBook / raw.width;
@@ -555,13 +578,58 @@
       c.width = vp.width; c.height = vp.height;
       await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
 
-      // Extract manual page label e.g. "2-3" — typically the last N-N text item on the page
+      // Extract page label (e.g. "2-5") — 4-pass strategy for robustness
       var pageLabel = String(i);
       try {
-        var tc2 = await page.getTextContent();
-        var lr = /^\d+-\d+$/;
-        var found = tc2.items.map(function(it){ return it.str.trim(); }).filter(function(s){ return lr.test(s); });
-        if (found.length > 0) { pageLabel = found[found.length - 1]; labelToPage.set(pageLabel, i); }
+        var tc2    = await page.getTextContent();
+        var pitems = tc2.items.filter(function(it){ return it.str.trim().length > 0; });
+        var dp     = '[-\u2013\u2011\u2012]';
+        var reAny  = new RegExp('(\\d+' + dp + '\\d+)');
+        var reExact= new RegExp('^\\d+' + dp + '\\d+$');
+        var norm   = function(s){ return s.replace(/[\u2013\u2011\u2012]/g,'-'); };
+        var label  = null;
+
+        if (pitems.length > 0) {
+          // Find y range (PDF coords: 0=bottom, maxY=top)
+          var minY = Infinity, maxY = -Infinity;
+          pitems.forEach(function(it){ var y=it.transform[5]; if(y<minY)minY=y; if(y>maxY)maxY=y; });
+          var botThresh = minY + (maxY - minY) * 0.18;
+
+          // Pass 1: join bottom-18% items without spaces (catches "2-" + "5" splits)
+          var botItems = pitems.filter(function(it){ return it.transform[5] <= botThresh; })
+                               .sort(function(a,b){ return a.transform[5]-b.transform[5]||a.transform[4]-b.transform[4]; });
+          if (botItems.length) {
+            var m1 = botItems.map(function(it){ return it.str.trim(); }).join('').match(reAny);
+            if (m1) label = norm(m1[1]);
+          }
+
+          // Pass 2: scan all items from end for exact N-N match
+          if (!label) {
+            for (var k=pitems.length-1; k>=0&&!label; k--) {
+              if (reExact.test(pitems[k].str.trim())) label = norm(pitems[k].str.trim());
+            }
+          }
+
+          // Pass 3: concatenate pairs/triples of adjacent items
+          if (!label) {
+            for (var k=0; k<pitems.length-1&&!label; k++) {
+              for (var l=k+1; l<=Math.min(k+3,pitems.length-1)&&!label; l++) {
+                var cat = pitems.slice(k,l+1).map(function(it){ return it.str.trim(); }).join('');
+                if (reExact.test(cat)) label = norm(cat);
+              }
+            }
+          }
+
+          // Pass 4: last resort — join all text and find last occurrence
+          if (!label) {
+            var full=pitems.map(function(it){ return it.str; }).join('');
+            var rg=new RegExp('\\d+'+dp+'\\d+','g'), mm, allM=[];
+            while((mm=rg.exec(full))!==null) allM.push(norm(mm[0]));
+            if (allM.length) label = allM[allM.length-1];
+          }
+
+          if (label) { pageLabel = label; labelToPage.set(label, i); }
+        }
       } catch(_) {}
 
       const item  = document.createElement('div');
@@ -578,70 +646,90 @@
   }
 
   async function buildTOC() {
-    var n      = pdfDoc.numPages;
-    var refRe  = /^\d+-\d+$/;
-    var entries = [];
+    var n        = pdfDoc.numPages;
+    var entries  = [];
+    var emptyRun = 0;
 
-    for (var pi = 0; pi < 2; pi++) {
-      var pageNum = n - 1 + pi;
-      var page    = await pdfDoc.getPage(pageNum);
-      var vp0     = page.getViewport({ scale: 1 });
-      var tc;
-      try { tc = await page.getTextContent(); } catch(_) { continue; }
-
-      // Split into left / right columns at the page midpoint
-      var colSplit  = vp0.width / 2;
-      var leftXs    = tc.items.filter(function(it){ return it.str.trim() && it.transform[4] < colSplit; }).map(function(it){ return it.transform[4]; });
-      var rightXs   = tc.items.filter(function(it){ return it.str.trim() && it.transform[4] >= colSplit; }).map(function(it){ return it.transform[4]; });
-      var leftBase  = leftXs.length  ? Math.min.apply(null, leftXs)  : 0;
-      var rightBase = rightXs.length ? Math.min.apply(null, rightXs) : 0;
-
-      // Group into lines by y (tolerance ±2 pt)
+    // ── helpers (hoisted outside loop) ──────────────────────────────
+    function groupLines(items) {
       var lineMap = new Map();
-      tc.items.forEach(function(it) {
-        if (!it.str.trim()) return;
-        var y = Math.round(it.transform[5] / 2) * 2;
+      items.forEach(function(it) {
+        var y = Math.round(it.transform[5] / 4) * 4; // ±4 pt tolerance
         if (!lineMap.has(y)) lineMap.set(y, []);
         lineMap.get(y).push(it);
       });
-
-      function parseLine(items, baseX) {
-        items = items.slice().sort(function(a, b) { return a.transform[4] - b.transform[4]; });
-        // Find rightmost N-N page ref
-        var refIdx = -1;
-        for (var j = items.length - 1; j >= 0; j--) {
-          if (refRe.test(items[j].str.trim())) { refIdx = j; break; }
-        }
-        if (refIdx < 0) return null;
-        var ref  = items[refIdx].str.trim();
-        // Name: join items before ref, strip dot leaders (... sequences) and extra spaces
-        var raw  = items.slice(0, refIdx).map(function(it){ return it.str; }).join('');
-        var name = raw.replace(/\.{2,}/g, '').replace(/\s+/g, ' ').trim();
-        if (name.length < 2) return null;
-        var target   = labelToPage.get(ref);
-        if (!target) return null;
-        var indented = (items[0].transform[4] - baseX) > 8;
-        return { name: name, ref: ref, page: target, indented: indented };
-      }
-
-      // Process lines top-to-bottom (highest y first in PDF space)
-      var ys = Array.from(lineMap.keys()).sort(function(a, b) { return b - a; });
-      ys.forEach(function(y) {
-        var all   = lineMap.get(y);
-        var left  = all.filter(function(it){ return it.transform[4] <  colSplit; });
-        var right = all.filter(function(it){ return it.transform[4] >= colSplit; });
-        var r;
-        if (left.length)  { r = parseLine(left,  leftBase);  if (r) entries.push(r); }
-        if (right.length) { r = parseLine(right, rightBase); if (r) entries.push(r); }
-      });
+      return lineMap;
     }
 
-    // Sort by page number for logical navigation order
+    function stripLeaders(raw) {
+      return raw
+        // Remove runs of 2+ separator chars (dot, dash, tilde, underscore, middle-dot, ellipsis)
+        // with optional whitespace between each — handles ". . . .", "~ ~", "-----", etc.
+        .replace(/([.\-~_\u00b7\u2022\u2026]\s*){2,}/g, ' ')
+        // Remove any trailing residue of those same chars
+        .replace(/[.\-~_\u00b7\u2022\u2026\s]+$/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    function parseLine(items, baseX) {
+      items = items.slice().sort(function(a, b) { return a.transform[4] - b.transform[4]; });
+      var lineText = items.map(function(it){ return it.str; }).join('');
+      var m2, lastMatch = null, lastIdx = 0;
+      var rp = /\d+[-\u2013\u2011\u2012]\d+/g;
+      while ((m2 = rp.exec(lineText)) !== null) { lastMatch = m2[0]; lastIdx = m2.index; }
+      if (!lastMatch) return null;
+      var ref  = lastMatch.replace(/[\u2013\u2011\u2012]/g, '-');
+      var name = stripLeaders(lineText.slice(0, lastIdx));
+      if (name.length < 2) return null;
+      var target = labelToPage.get(ref);
+      if (!target) return null;
+      var indented = (items[0].transform[4] - baseX) > 8;
+      return { name: name, ref: ref, page: target, indented: indented };
+    }
+    // ────────────────────────────────────────────────────────────────
+
+    // Scan backwards from the last page; stop after 2 consecutive pages with no entries
+    for (var pi = 0; pi < 8 && emptyRun < 2; pi++) {
+      var pageNum = n - pi;
+      if (pageNum < 1) break;
+      var page = await pdfDoc.getPage(pageNum);
+      var vp0  = page.getViewport({ scale: 1 });
+      var tc;
+      try { tc = await page.getTextContent(); } catch(_) { emptyRun++; continue; }
+
+      var colSplit   = vp0.width / 2;
+      var leftItems  = tc.items.filter(function(it){ return it.str.trim() && it.transform[4] <  colSplit; });
+      var rightItems = tc.items.filter(function(it){ return it.str.trim() && it.transform[4] >= colSplit; });
+      var leftBase   = leftItems.length  ? Math.min.apply(null, leftItems.map(function(it){ return it.transform[4]; })) : 0;
+      var rightBase  = rightItems.length ? Math.min.apply(null, rightItems.map(function(it){ return it.transform[4]; })) : 0;
+
+      var pageEntries = [];
+      [[leftItems, leftBase], [rightItems, rightBase]].forEach(function(pair) {
+        var colItems = pair[0], baseX = pair[1];
+        var lineMap  = groupLines(colItems);
+        Array.from(lineMap.keys()).sort(function(a, b){ return b - a; }).forEach(function(y) {
+          var r = parseLine(lineMap.get(y), baseX);
+          if (r) pageEntries.push(r);
+        });
+      });
+
+      if (pageEntries.length === 0) { emptyRun++; } else { emptyRun = 0; entries = entries.concat(pageEntries); }
+    }
+
+    // Deduplicate by ref+name
+    var seen = new Set();
+    entries = entries.filter(function(e) {
+      var key = e.ref + '|' + e.name;
+      if (seen.has(key)) return false;
+      seen.add(key); return true;
+    });
+
     entries.sort(function(a, b) { return a.page - b.page; });
 
     var tocStatus  = document.getElementById('tocStatus');
     var tocResults = document.getElementById('tocResults');
-    if (entries.length === 0) { tocStatus.textContent = 'No index entries found on last 2 pages.'; return; }
+    if (entries.length === 0) { tocStatus.textContent = 'No index entries found.'; return; }
     tocStatus.textContent = entries.length + ' entries';
     tocResults.innerHTML = '';
     entries.forEach(function(entry) {
