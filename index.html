@@ -522,9 +522,11 @@
       highlightCanvas.getContext('2d').clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
     }
 
-    // scroll only the viewport panel, not the window
-    viewport_el.scrollTop  = 0;
-    viewport_el.scrollLeft = 0;
+    // Reset scroll after layout has settled
+    requestAnimationFrame(function() {
+      viewport_el.scrollTop  = 0;
+      viewport_el.scrollLeft = 0;
+    });
 
     currentPage      = num;
     pageInput.value  = num;
@@ -695,117 +697,197 @@
     }
   }
 
-  async function buildTOC() {
-    var n        = pdfDoc.numPages;
-    var entries  = [];
-    var emptyRun = 0;
-
-    // ── helpers (hoisted outside loop) ──────────────────────────────
-    function groupLines(items) {
-      var lineMap = new Map();
-      items.forEach(function(it) {
-        var y = Math.round(it.transform[5] / 4) * 4; // ±4 pt tolerance
-        if (!lineMap.has(y)) lineMap.set(y, []);
-        lineMap.get(y).push(it);
-      });
-      return lineMap;
-    }
-
-    function stripLeaders(raw) {
-      return raw
-        // Remove runs of 2+ separator chars (dot, dash, tilde, underscore, middle-dot, ellipsis)
-        // with optional whitespace between each — handles ". . . .", "~ ~", "-----", etc.
-        .replace(/([.\-~_\u00b7\u2022\u2026]\s*){2,}/g, ' ')
-        // Remove any trailing residue of those same chars
-        .replace(/[.\-~_\u00b7\u2022\u2026\s]+$/, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-    }
-
-    function parseLine(items, baseX) {
-      items = items.slice().sort(function(a, b) { return a.transform[4] - b.transform[4]; });
-      var LEADER_ONLY = /^[\s.\-~_\u00b7\u2022\u2026]+$/;
-      var norm = function(s) { return s.replace(/[\u2013\u2011\u2012]/g, '-'); };
-      // Join without spaces to reliably find split N-N refs (e.g. "3" + "-" + "5")
-      var joined = items.map(function(it){ return it.str; }).join('');
-      var rp = /\d+[-\u2013\u2011\u2012]\d+/g;
-      var m2, lastMatch = null, lastIdx = -1;
-      while ((m2 = rp.exec(joined)) !== null) { lastMatch = m2[0]; lastIdx = m2.index; }
-      if (!lastMatch || lastIdx < 0) return null;
-      var ref    = norm(lastMatch);
-      var target = labelToPage.get(ref);
-      if (!target) return null;
-      // Walk items tracking char position; collect name items that fall entirely before ref
-      var charPos = 0, nameItems = [];
-      for (var i = 0; i < items.length; i++) {
-        var s = items[i].str;
-        if (charPos + s.length <= lastIdx) {
-          if (!LEADER_ONLY.test(s)) nameItems.push(s.trim());
-        } else { break; }
-        charPos += s.length;
-      }
-      var name = nameItems.join(' ').replace(/\s+/g, ' ').trim();
-      name = stripLeaders(name);
-      if (name.length < 2) return null;
-      var indented = (items[0].transform[4] - baseX) > 8;
-      return { name: name, ref: ref, page: target, indented: indented };
-    }
-    // ────────────────────────────────────────────────────────────────
-
-    // Scan backwards from the last page; stop only on pages with no text at all
-    for (var pi = 0; pi < 15; pi++) {
-      var pageNum = n - pi;
-      if (pageNum < 1) break;
-      var page = await pdfDoc.getPage(pageNum);
-      var vp0  = page.getViewport({ scale: 1 });
-      var tc;
-      try { tc = await page.getTextContent(); } catch(_) { continue; }
-      if (tc.items.length === 0) { emptyRun++; if (emptyRun >= 4) break; continue; }
-
-      var colSplit   = vp0.width / 2;
-      var leftItems  = tc.items.filter(function(it){ return it.str.trim() && it.transform[4] <  colSplit; });
-      var rightItems = tc.items.filter(function(it){ return it.str.trim() && it.transform[4] >= colSplit; });
-      var leftBase   = leftItems.length  ? Math.min.apply(null, leftItems.map(function(it){ return it.transform[4]; })) : 0;
-      var rightBase  = rightItems.length ? Math.min.apply(null, rightItems.map(function(it){ return it.transform[4]; })) : 0;
-
-      var pageEntries = [];
-      [[leftItems, leftBase], [rightItems, rightBase]].forEach(function(pair) {
-        var colItems = pair[0], baseX = pair[1];
-        var lineMap  = groupLines(colItems);
-        Array.from(lineMap.keys()).sort(function(a, b){ return b - a; }).forEach(function(y) {
-          var r = parseLine(lineMap.get(y), baseX);
-          if (r) pageEntries.push(r);
-        });
-      });
-
-      if (pageEntries.length > 0) { emptyRun = 0; entries = entries.concat(pageEntries); }
-    }
-
-    // Deduplicate by ref+name
-    var seen = new Set();
-    entries = entries.filter(function(e) {
-      var key = e.ref + '|' + e.name;
-      if (seen.has(key)) return false;
-      seen.add(key); return true;
-    });
-
-    entries.sort(function(a, b) { return a.page - b.page; });
+  function buildTOC() {
+    // Hardcoded index entries from the manual's index pages (scanned manually for accuracy).
+    // ref = "chapter-page" label; indented = sub-item under a parent heading.
+    var RAW = [
+      { name: 'Air Cleaner',                                          ref: '3-5',   indented: false },
+      { name: 'Air Cleaner Housing/Direct Air Intake (D.A.I.) Duct', ref: '5-4',   indented: false },
+      { name: 'Alternator',                                           ref: '15-8',  indented: false },
+      { name: 'Battery',                                              ref: '15-5',  indented: false },
+      { name: 'Battery Case',                                         ref: '15-11', indented: false },
+      { name: 'Brake Fluid',                                          ref: '3-19',  indented: false },
+      { name: 'Brake Fluid Replacement/Air Bleeding',                 ref: '14-4',  indented: false },
+      { name: 'Brake Pad/Disc',                                       ref: '14-6',  indented: false },
+      { name: 'Brake Pad Wear',                                       ref: '3-20',  indented: false },
+      { name: 'Brake System',                                         ref: '3-21',  indented: false },
+      { name: 'Cable & Harness Routing',                              ref: '1-20',  indented: false },
+      { name: 'Camshaft Installation',                                ref: '8-22',  indented: false },
+      { name: 'Camshaft Removal',                                     ref: '8-5',   indented: false },
+      { name: 'Carburetor Assembly',                                  ref: '5-13',  indented: false },
+      { name: 'Choke',                                                ref: '3-5',   indented: true  },
+      { name: 'Disassembly',                                          ref: '5-8',   indented: true  },
+      { name: 'Installation',                                         ref: '5-19',  indented: true  },
+      { name: 'Removal',                                              ref: '5-5',   indented: true  },
+      { name: 'Synchronization',                                      ref: '3-12',  indented: true  },
+      { name: 'Charging System Inspection',                           ref: '15-6',  indented: false },
+      { name: 'Clutch Disc',                                          ref: '17-10', indented: false },
+      { name: 'Clutch Installation',                                  ref: '9-11',  indented: false },
+      { name: 'Clutch Removal',                                       ref: '9-3',   indented: false },
+      { name: 'Clutch Switch',                                        ref: '18-11', indented: false },
+      { name: 'Clutch System',                                        ref: '3-21',  indented: false },
+      { name: 'Combination Meter',                                    ref: '18-7',  indented: false },
+      { name: 'Coolant Replacement',                                  ref: '3-15',  indented: false },
+      { name: 'Coolant Temperature Gauge',                            ref: '18-15', indented: false },
+      { name: 'Cooling System',                                       ref: '3-15',  indented: false },
+      { name: 'Crankcase Assembly',                                   ref: '10-12', indented: false },
+      { name: 'Crankcase Separation',                                 ref: '10-3',  indented: false },
+      { name: 'Crankshaft',                                           ref: '11-3',  indented: false },
+      { name: 'Cylinder Compression',                                 ref: '8-4',   indented: false },
+      { name: 'Cylinder Head Assembly',                               ref: '8-19',  indented: false },
+      { name: 'Disassembly',                                          ref: '8-19',  indented: true  },
+      { name: 'Installation',                                         ref: '8-20',  indented: true  },
+      { name: 'Removal',                                              ref: '8-9',   indented: true  },
+      { name: 'Cylinder/Piston/Connecting Rod',                       ref: '11-7',  indented: false },
+      { name: 'Direct Air Intake (D.A.I.) System',                    ref: '5-25',  indented: false },
+      { name: 'Drive Chain',                                          ref: '3-16',  indented: false },
+      { name: 'Emission Control Information Labels (U.S.A. only)',    ref: '1-33',  indented: false },
+      { name: 'Emission Control Systems (U.S.A. only)',               ref: '6-1',   indented: false },
+      { name: 'Engine Idle Speed',                                    ref: '3-14',  indented: false },
+      { name: 'Engine Installation',                                  ref: '7-4',   indented: false },
+      { name: 'Engine Removal',                                       ref: '7-2',   indented: false },
+      { name: 'Engine Oil/Oil Filter',                                ref: '3-11',  indented: false },
+      { name: 'Evaporative Emission Control System (California type only)', ref: '3-15', indented: false },
+      { name: 'Evaporative Emission Control System (California type only)', ref: '5-39', indented: false },
+      { name: 'Exhaust System',                                       ref: '2-11',  indented: false },
+      { name: 'Fan Motor Switch',                                     ref: '18-14', indented: false },
+      { name: 'Flywheel/Starter Clutch',                              ref: '17-10', indented: false },
+      { name: 'Fork',                                                 ref: '12-14', indented: false },
+      { name: 'Front Brake Light Switch',                             ref: '18-11', indented: false },
+      { name: 'Front Caliper',                                        ref: '14-11', indented: false },
+      { name: 'Front Master Cylinder',                                ref: '14-7',  indented: false },
+      { name: 'Front Wheel',                                          ref: '12-8',  indented: false },
+      { name: 'Fuel Line',                                            ref: '3-4',   indented: false },
+      { name: 'Fuel Pump',                                            ref: '18-16', indented: false },
+      { name: 'Fuel Tank',                                            ref: '2-4',   indented: false },
+      { name: 'Gearshift Linkage',                                    ref: '9-8',   indented: false },
+      { name: 'General Safety',                                       ref: '1-1',   indented: false },
+      { name: 'Handlebars',                                           ref: '12-3',  indented: false },
+      { name: 'Handlebar Switch',                                     ref: '18-12', indented: false },
+      { name: 'Headlight',                                            ref: '18-5',  indented: false },
+      { name: 'Headlight Aim',                                        ref: '3-21',  indented: false },
+      { name: 'High Altitude Adjustment (U.S.A. only)',               ref: '5-23',  indented: false },
+      { name: 'Horn',                                                 ref: '18-17', indented: false },
+      { name: 'Ignition Coil',                                        ref: '16-8',  indented: false },
+      { name: 'Ignition Pulse Generator',                             ref: '16-8',  indented: false },
+      { name: 'Ignition Switch',                                      ref: '18-13', indented: false },
+      { name: 'Ignition System Inspection',                           ref: '16-4',  indented: false },
+      { name: 'Ignition Timing',                                      ref: '16-13', indented: false },
+      { name: 'License Light',                                        ref: '18-7',  indented: false },
+      { name: 'Lubrication & Seal Points',                            ref: '1-18',  indented: false },
+      { name: 'Maintenance Cover',                                    ref: '3-3',   indented: false },
+      { name: 'Maintenance Schedule',                                 ref: '3-3',   indented: false },
+      { name: 'Model Identification',                                 ref: '1-3',   indented: false },
+      { name: 'Neutral Switch',                                       ref: '18-11', indented: false },
+      { name: 'Nuts, Bolts, Fasteners',                               ref: '3-23',  indented: false },
+      { name: 'Oil Cooler',                                           ref: '4-11',  indented: false },
+      { name: 'Oil Pan',                                              ref: '4-6',   indented: false },
+      { name: 'Oil Pump',                                             ref: '4-3',   indented: false },
+      { name: 'Oil Pressure Check',                                   ref: '4-3',   indented: false },
+      { name: 'Oil Pressure Switch',                                  ref: '18-10', indented: false },
+      { name: 'Pilot Screw Adjustment',                               ref: '5-22',  indented: false },
+      { name: 'Radiator Coolant',                                     ref: '3-14',  indented: false },
+      { name: 'Radiator/Cooling Fan',                                 ref: '6-8',   indented: false },
+      { name: 'Radiator Reserve Tank',                                ref: '3-15',  indented: false },
+      { name: 'Rear Brake Light Switch',                              ref: '18-11', indented: false },
+      { name: 'Rear Caliper',                                         ref: '14-19', indented: false },
+      { name: 'Rear Fender A',                                        ref: '2-9',   indented: false },
+      { name: 'Rear Fender B',                                        ref: '2-10',  indented: false },
+      { name: 'Rear Master Cylinder',                                 ref: '14-14', indented: false },
+      { name: 'Rear Wheel',                                           ref: '13-3',  indented: false },
+      { name: 'Regulator/Rectifier',                                  ref: '15-8',  indented: false },
+      { name: 'Seat',                                                 ref: '2-4',   indented: false },
+      { name: 'Secondary Air Supply System (California type only)',   ref: '3-15',  indented: false },
+      { name: 'Secondary Air Supply System (California type only)',   ref: '5-38',  indented: false },
+      { name: 'Service Information',                                  ref: '1-1',   indented: false },
+      { name: 'Charging System/Alternator',                           ref: '15-1',  indented: true  },
+      { name: 'Clutch/Gearshift Linkage',                             ref: '9-1',   indented: true  },
+      { name: 'Cooling System',                                       ref: '6-1',   indented: true  },
+      { name: 'Crankcase/Transmission',                               ref: '10-1',  indented: true  },
+      { name: 'Cylinder Head/Valves',                                 ref: '8-1',   indented: true  },
+      { name: 'Cylinder/Piston/Crankshaft',                           ref: '11-1',  indented: true  },
+      { name: 'Electric Starter/Starter Clutch',                      ref: '17-1',  indented: true  },
+      { name: 'Engine Removal/Installation',                          ref: '7-1',   indented: true  },
+      { name: 'Frame/Body Panels/Exhaust System',                     ref: '2-1',   indented: true  },
+      { name: 'Front Wheel/Suspension/Steering',                      ref: '12-1',  indented: true  },
+      { name: 'Fuel System',                                          ref: '5-1',   indented: true  },
+      { name: 'Hydraulic Disc Brake',                                 ref: '14-2',  indented: true  },
+      { name: 'Ignition System',                                      ref: '16-2',  indented: true  },
+      { name: 'Lights/Meters/Switches',                               ref: '18-1',  indented: true  },
+      { name: 'Lubrication System',                                   ref: '4-2',   indented: true  },
+      { name: 'Maintenance',                                          ref: '3-1',   indented: true  },
+      { name: 'Rear Wheel/Suspension',                                ref: '13-1',  indented: true  },
+      { name: 'Service Rules',                                        ref: '1-2',   indented: false },
+      { name: 'Shock Absorber',                                       ref: '13-8',  indented: false },
+      { name: 'Side Cover',                                           ref: '2-2',   indented: false },
+      { name: 'Side Fairing',                                         ref: '2-4',   indented: false },
+      { name: 'Side Stand',                                           ref: '3-22',  indented: false },
+      { name: 'Side Stand Switch',                                    ref: '18-18', indented: false },
+      { name: 'Spark Plug',                                           ref: '3-6',   indented: false },
+      { name: 'Specifications',                                       ref: '1-4',   indented: false },
+      { name: 'Speed Sensor',                                         ref: '18-10', indented: false },
+      { name: 'Starter Motor',                                        ref: '17-4',  indented: false },
+      { name: 'Starter Rotor Switch',                                 ref: '17-9',  indented: false },
+      { name: 'Steering Head Bearings',                               ref: '3-24',  indented: false },
+      { name: 'Steering Stem',                                        ref: '12-22', indented: false },
+      { name: 'Sub Fuse',                                             ref: '3-23',  indented: false },
+      { name: 'Suspension',                                           ref: '3-23',  indented: false },
+      { name: 'Suspension Linkage',                                   ref: '13-11', indented: false },
+      { name: 'Swingarm',                                             ref: '13-16', indented: false },
+      { name: 'System Testing',                                       ref: '6-3',   indented: false },
+      { name: 'Tail/Brake Light',                                     ref: '18-6',  indented: false },
+      { name: 'Tail Cowl',                                            ref: '2-3',   indented: false },
+      { name: 'Thermostat',                                           ref: '6-6',   indented: false },
+      { name: 'Thermo Valve',                                         ref: '6-7',   indented: false },
+      { name: 'Throttle Operation',                                   ref: '3-4',   indented: false },
+      { name: 'Throttle Position Sensor',                             ref: '16-11', indented: false },
+      { name: 'Tools',                                                ref: '1-16',  indented: false },
+      { name: 'Torque Values',                                        ref: '1-13',  indented: false },
+      { name: 'Transmission',                                         ref: '10-4',  indented: false },
+      { name: 'Troubleshooting',                                      ref: '1-1',   indented: false },
+      { name: 'Charging System/Alternator',                           ref: '15-3',  indented: true  },
+      { name: 'Clutch/Gearshift Linkage',                             ref: '9-2',   indented: true  },
+      { name: 'Cooling System',                                       ref: '6-2',   indented: true  },
+      { name: 'Crankcase/Transmission',                               ref: '10-2',  indented: true  },
+      { name: 'Cylinder Head/Valves',                                 ref: '8-3',   indented: true  },
+      { name: 'Cylinder/Piston/Crankshaft',                           ref: '11-2',  indented: true  },
+      { name: 'Electric Starter/Starter Clutch',                      ref: '11-2',  indented: true  },
+      { name: 'Frame/Body Panels/Exhaust System',                     ref: '2-1',   indented: true  },
+      { name: 'Front Wheel/Suspension/Steering',                      ref: '12-2',  indented: true  },
+      { name: 'Fuel System',                                          ref: '5-3',   indented: true  },
+      { name: 'Hydraulic Disc Brake',                                 ref: '14-3',  indented: true  },
+      { name: 'Ignition System',                                      ref: '16-3',  indented: true  },
+      { name: 'Lights/Meters/Switches',                               ref: '18-3',  indented: true  },
+      { name: 'Lubrication System',                                   ref: '4-2',   indented: true  },
+      { name: 'Rear Wheel/Suspension',                                ref: '13-2',  indented: true  },
+      { name: 'Turn Signal',                                          ref: '18-5',  indented: false },
+      { name: 'Turn Signal Relay',                                    ref: '18-17', indented: false },
+      { name: 'Upper Fairing',                                        ref: '2-5',   indented: false },
+      { name: 'Valve Clearance',                                      ref: '3-7',   indented: false },
+      { name: 'Valve Guide Replacement',                              ref: '8-14',  indented: false },
+      { name: 'Valve Seat Inspection/Refacing',                       ref: '8-16',  indented: false },
+      { name: 'Water Pump',                                           ref: '6-10',  indented: false },
+      { name: 'Wheels/Tires',                                         ref: '3-24',  indented: false },
+    ];
 
     var tocStatus  = document.getElementById('tocStatus');
     var tocResults = document.getElementById('tocResults');
-    if (entries.length === 0) { tocStatus.textContent = 'No index entries found.'; return; }
-    tocStatus.textContent = entries.length + ' entries';
     tocResults.innerHTML = '';
-    entries.forEach(function(entry) {
+    var shown = 0;
+    RAW.forEach(function(e) {
+      var page = labelToPage.get(e.ref);
+      if (!page) return; // skip if page indexing hasn't resolved this label yet
+      shown++;
       var div = document.createElement('div');
-      div.className = 'toc-item' + (entry.indented ? ' toc-sub' : '');
-      div.innerHTML = '<span class="toc-name">' + entry.name + '</span><span class="toc-ref">' + entry.ref + '</span>';
+      div.className = 'toc-item' + (e.indented ? ' toc-sub' : '');
+      div.innerHTML = '<span class="toc-name">' + e.name + '</span><span class="toc-ref">' + e.ref + '</span>';
       div.addEventListener('click', function() {
-        renderPage(entry.page);
+        renderPage(page);
         document.getElementById('tocPanel').classList.remove('open');
       });
       tocResults.appendChild(div);
     });
+    tocStatus.textContent = shown + ' entries';
   }
 
   async function buildTextIndex() {
