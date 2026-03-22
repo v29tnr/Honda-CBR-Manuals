@@ -496,9 +496,12 @@
 
     const page  = await pdfDoc.getPage(num);
     const scale = computeScale(page);
-    const vp    = page.getViewport({ scale });
-    canvas.width  = vp.width;
-    canvas.height = vp.height;
+    const dpr   = window.devicePixelRatio || 1;
+    const vp    = page.getViewport({ scale: scale * dpr });
+    canvas.width        = vp.width;
+    canvas.height       = vp.height;
+    canvas.style.width  = (vp.width  / dpr) + 'px';
+    canvas.style.height = (vp.height / dpr) + 'px';
 
     activeRender = page.render({ canvasContext: ctx, viewport: vp });
     try { await activeRender.promise; }
@@ -506,8 +509,10 @@
     activeRender = null;
 
     // Sync highlight overlay size and redraw
-    highlightCanvas.width  = canvas.width;
-    highlightCanvas.height = canvas.height;
+    highlightCanvas.width        = canvas.width;
+    highlightCanvas.height       = canvas.height;
+    highlightCanvas.style.width  = canvas.style.width;
+    highlightCanvas.style.height = canvas.style.height;
     if (highlightQuery) {
       drawHighlights(page, highlightQuery, vp);
     } else {
@@ -674,29 +679,43 @@
 
     function parseLine(items, baseX) {
       items = items.slice().sort(function(a, b) { return a.transform[4] - b.transform[4]; });
-      var lineText = items.map(function(it){ return it.str; }).join('');
-      var m2, lastMatch = null, lastIdx = 0;
+      var LEADER_ONLY = /^[\s.\-~_\u00b7\u2022\u2026]+$/;
+      var norm = function(s) { return s.replace(/[\u2013\u2011\u2012]/g, '-'); };
+      // Join without spaces to reliably find split N-N refs (e.g. "3" + "-" + "5")
+      var joined = items.map(function(it){ return it.str; }).join('');
       var rp = /\d+[-\u2013\u2011\u2012]\d+/g;
-      while ((m2 = rp.exec(lineText)) !== null) { lastMatch = m2[0]; lastIdx = m2.index; }
-      if (!lastMatch) return null;
-      var ref  = lastMatch.replace(/[\u2013\u2011\u2012]/g, '-');
-      var name = stripLeaders(lineText.slice(0, lastIdx));
-      if (name.length < 2) return null;
+      var m2, lastMatch = null, lastIdx = -1;
+      while ((m2 = rp.exec(joined)) !== null) { lastMatch = m2[0]; lastIdx = m2.index; }
+      if (!lastMatch || lastIdx < 0) return null;
+      var ref    = norm(lastMatch);
       var target = labelToPage.get(ref);
       if (!target) return null;
+      // Walk items tracking char position; collect name items that fall entirely before ref
+      var charPos = 0, nameItems = [];
+      for (var i = 0; i < items.length; i++) {
+        var s = items[i].str;
+        if (charPos + s.length <= lastIdx) {
+          if (!LEADER_ONLY.test(s)) nameItems.push(s.trim());
+        } else { break; }
+        charPos += s.length;
+      }
+      var name = nameItems.join(' ').replace(/\s+/g, ' ').trim();
+      name = stripLeaders(name);
+      if (name.length < 2) return null;
       var indented = (items[0].transform[4] - baseX) > 8;
       return { name: name, ref: ref, page: target, indented: indented };
     }
     // ────────────────────────────────────────────────────────────────
 
-    // Scan backwards from the last page; stop after 2 consecutive pages with no entries
-    for (var pi = 0; pi < 8 && emptyRun < 2; pi++) {
+    // Scan backwards from the last page; stop only on pages with no text at all
+    for (var pi = 0; pi < 15; pi++) {
       var pageNum = n - pi;
       if (pageNum < 1) break;
       var page = await pdfDoc.getPage(pageNum);
       var vp0  = page.getViewport({ scale: 1 });
       var tc;
-      try { tc = await page.getTextContent(); } catch(_) { emptyRun++; continue; }
+      try { tc = await page.getTextContent(); } catch(_) { continue; }
+      if (tc.items.length === 0) { emptyRun++; if (emptyRun >= 4) break; continue; }
 
       var colSplit   = vp0.width / 2;
       var leftItems  = tc.items.filter(function(it){ return it.str.trim() && it.transform[4] <  colSplit; });
@@ -714,7 +733,7 @@
         });
       });
 
-      if (pageEntries.length === 0) { emptyRun++; } else { emptyRun = 0; entries = entries.concat(pageEntries); }
+      if (pageEntries.length > 0) { emptyRun = 0; entries = entries.concat(pageEntries); }
     }
 
     // Deduplicate by ref+name
