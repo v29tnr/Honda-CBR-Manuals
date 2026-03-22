@@ -634,11 +634,11 @@
 
       const item  = document.createElement('div');
       item.className = 'thumb-item' + (i === 1 ? ' active' : '');
-      const label = document.createElement('div');
-      label.className = 'thumb-label';
-      label.textContent = pageLabel;
+      const labelEl = document.createElement('div');
+      labelEl.className = 'thumb-label';
+      labelEl.textContent = pageLabel;
       item.appendChild(c);
-      item.appendChild(label);
+      item.appendChild(labelEl);
       item.addEventListener('click', () => { highlightQuery = null; renderPage(i); });
       sidebar.appendChild(item);
       loadingText.textContent = 'Thumbnails ' + i + '/' + pdfDoc.numPages;
