@@ -575,7 +575,102 @@
     });
   }
 
-  async function buildThumbs() {
+  // ── Build a complete, globally-consistent page-label index ──────────────
+  // Scans ALL pages for "N-M" patterns, then uses a greedy monotone algorithm
+  // to assign one label per page, filling gaps with linear interpolation.
+  async function buildPageLabels() {
+    var dp      = '[-\u2013\u2011\u2012]';
+    var reExact = new RegExp('^\\d+' + dp + '\\d+$');
+    var norm    = function(s){ return s.replace(/[\u2013\u2011\u2012]/g, '-'); };
+    function lv(s) { var p=s.split('-'); return parseInt(p[0],10)*100000+parseInt(p[1],10); }
+    function lp(s) { var p=s.split('-'); return { ch:parseInt(p[0],10), pg:parseInt(p[1],10) }; }
+
+    // Phase 1: collect ALL candidate N-M labels found on each page
+    var perPage = []; // perPage[i-1] = string[] for page i
+    for (var i = 1; i <= pdfDoc.numPages; i++) {
+      loadingText.textContent = 'Indexing ' + i + '\u2009/\u2009' + pdfDoc.numPages;
+      var found = [], seen = new Set();
+      var addL  = function(s) { s=norm(s.trim()); if(s&&!seen.has(s)){ seen.add(s); found.push(s); } };
+      try {
+        var pg    = await pdfDoc.getPage(i);
+        var tc    = await pg.getTextContent();
+        var items = tc.items.filter(function(it){ return it.str.trim().length > 0; });
+        // Sliding-window join of 1..6 consecutive items (catches split labels like "3" + "-" + "5")
+        for (var w = 1; w <= 6 && w <= items.length; w++) {
+          for (var j = 0; j + w <= items.length; j++) {
+            var cat = '';
+            for (var k = j; k < j+w; k++) cat += items[k].str;
+            if (reExact.test(cat.trim())) addL(cat);
+          }
+        }
+        // Full-page greedy regex scan as safety net
+        var full = items.map(function(it){ return it.str; }).join('');
+        var reG  = new RegExp('\\d+' + dp + '\\d+', 'g'), mm;
+        while ((mm = reG.exec(full)) !== null) addL(mm[0]);
+      } catch(_) {}
+      perPage.push(found);
+    }
+
+    // Phase 2: greedy forward pass — pick the smallest valid label per page
+    // that keeps the overall sequence strictly monotone increasing
+    var assigned = new Array(pdfDoc.numPages + 1).fill(null); // 1-indexed
+    var lastVal = -1, lastStr = null;
+    for (var i = 1; i <= pdfDoc.numPages; i++) {
+      var cands = perPage[i-1]
+        .map(function(s){ return { s:s, v:lv(s) }; })
+        .filter(function(c){ return c.v > lastVal; })
+        .sort(function(a,b){ return a.v - b.v; });
+      if (!cands.length) continue;
+      // Prefer same chapter as last assignment to avoid stray cross-refs jumping chapters
+      var best = cands[0];
+      if (lastStr && cands.length > 1) {
+        var lch = lp(lastStr).ch;
+        var sameCh = cands.filter(function(c){ return lp(c.s).ch === lch; });
+        if (sameCh.length) best = sameCh[0];
+      }
+      assigned[i] = best.s;
+      lastVal = best.v;
+      lastStr = best.s;
+    }
+
+    // Phase 3: linear interpolation for pages with no detected label
+    for (var i = 1; i <= pdfDoc.numPages; i++) {
+      if (assigned[i]) continue;
+      var pi = -1, ni = -1;
+      for (var j=i-1; j>=1; j--)               { if (assigned[j]) { pi=j; break; } }
+      for (var j=i+1; j<=pdfDoc.numPages; j++) { if (assigned[j]) { ni=j; break; } }
+      var pL = pi>0 ? lp(assigned[pi]) : null;
+      var nL = ni>0 ? lp(assigned[ni]) : null;
+      var guess = null;
+      if (pL && nL && pL.ch === nL.ch) {
+        var pg = Math.round(pL.pg + (i-pi) * (nL.pg-pL.pg) / (ni-pi));
+        guess = pL.ch + '-' + pg;
+      } else if (pL) {
+        guess = pL.ch + '-' + (pL.pg + (i - pi));
+      } else if (nL) {
+        guess = nL.ch + '-' + Math.max(1, nL.pg - (ni - i));
+      }
+      if (guess) assigned[i] = guess;
+    }
+
+    // Phase 4: populate labelToPage
+    // First pass: interpolated (low priority)
+    labelToPage.clear();
+    for (var i = 1; i <= pdfDoc.numPages; i++) {
+      if (assigned[i]) labelToPage.set(assigned[i], i);
+    }
+    // Second pass: confirmed-found labels override
+    for (var i = 1; i <= pdfDoc.numPages; i++) {
+      if (assigned[i] && perPage[i-1].indexOf(assigned[i]) >= 0) {
+        labelToPage.set(assigned[i], i);
+      }
+    }
+
+    return assigned; // null-padded, 1-indexed (assigned[i] = label for page i)
+  }
+
+  // ── Render sidebar thumbnails (labels pre-computed by buildPageLabels) ──
+  async function buildThumbs(assigned) {
     for (let i = 1; i <= pdfDoc.numPages; i++) {
       const page = await pdfDoc.getPage(i);
       const vp   = page.getViewport({ scale: THUMB_SCALE });
@@ -583,60 +678,7 @@
       c.width = vp.width; c.height = vp.height;
       await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
 
-      // Extract page label (e.g. "2-5") — 4-pass strategy for robustness
-      var pageLabel = String(i);
-      try {
-        var tc2    = await page.getTextContent();
-        var pitems = tc2.items.filter(function(it){ return it.str.trim().length > 0; });
-        var dp     = '[-\u2013\u2011\u2012]';
-        var reAny  = new RegExp('(\\d+' + dp + '\\d+)');
-        var reExact= new RegExp('^\\d+' + dp + '\\d+$');
-        var norm   = function(s){ return s.replace(/[\u2013\u2011\u2012]/g,'-'); };
-        var label  = null;
-
-        if (pitems.length > 0) {
-          // Find y range (PDF coords: 0=bottom, maxY=top)
-          var minY = Infinity, maxY = -Infinity;
-          pitems.forEach(function(it){ var y=it.transform[5]; if(y<minY)minY=y; if(y>maxY)maxY=y; });
-          var botThresh = minY + (maxY - minY) * 0.18;
-
-          // Pass 1: join bottom-18% items without spaces (catches "2-" + "5" splits)
-          var botItems = pitems.filter(function(it){ return it.transform[5] <= botThresh; })
-                               .sort(function(a,b){ return a.transform[5]-b.transform[5]||a.transform[4]-b.transform[4]; });
-          if (botItems.length) {
-            var m1 = botItems.map(function(it){ return it.str.trim(); }).join('').match(reAny);
-            if (m1) label = norm(m1[1]);
-          }
-
-          // Pass 2: scan all items from end for exact N-N match
-          if (!label) {
-            for (var k=pitems.length-1; k>=0&&!label; k--) {
-              if (reExact.test(pitems[k].str.trim())) label = norm(pitems[k].str.trim());
-            }
-          }
-
-          // Pass 3: concatenate pairs/triples of adjacent items
-          if (!label) {
-            for (var k=0; k<pitems.length-1&&!label; k++) {
-              for (var l=k+1; l<=Math.min(k+3,pitems.length-1)&&!label; l++) {
-                var cat = pitems.slice(k,l+1).map(function(it){ return it.str.trim(); }).join('');
-                if (reExact.test(cat)) label = norm(cat);
-              }
-            }
-          }
-
-          // Pass 4: last resort — join all text and find last occurrence
-          if (!label) {
-            var full=pitems.map(function(it){ return it.str; }).join('');
-            var rg=new RegExp('\\d+'+dp+'\\d+','g'), mm, allM=[];
-            while((mm=rg.exec(full))!==null) allM.push(norm(mm[0]));
-            if (allM.length) label = allM[allM.length-1];
-          }
-
-          if (label) { pageLabel = label; labelToPage.set(label, i); }
-        }
-      } catch(_) {}
-
+      const pageLabel = assigned[i] || String(i);
       const item  = document.createElement('div');
       item.className = 'thumb-item' + (i === 1 ? ' active' : '');
       const labelEl = document.createElement('div');
@@ -646,7 +688,7 @@
       item.appendChild(labelEl);
       item.addEventListener('click', () => { highlightQuery = null; renderPage(i); });
       sidebar.appendChild(item);
-      loadingText.textContent = 'Thumbnails ' + i + '/' + pdfDoc.numPages;
+      loadingText.textContent = 'Thumbnails ' + i + '\u2009/\u2009' + pdfDoc.numPages;
     }
   }
 
@@ -827,9 +869,12 @@
       pdfDoc = await task.promise;
       totalSpan.textContent = pdfDoc.numPages;
       pageInput.max = pdfDoc.numPages;
+      // Index all pages before showing viewer — fast (text only, no rendering)
+      loadingText.textContent = 'Indexing pages\u2026';
+      const assigned = await buildPageLabels();
       await renderPage(1);
       overlay.style.display = 'none';
-      buildThumbs().then(buildTOC);
+      buildThumbs(assigned).then(buildTOC);
       buildTextIndex();
     } catch(err) {
       loadingText.textContent = 'Failed to load PDF. Make sure F3manual.pdf is in the same folder.';
