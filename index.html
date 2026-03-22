@@ -601,16 +601,13 @@
         var items = tc.items.filter(function(it){ return it.str.trim().length > 0; });
         if (items.length === 0) { perPage.push(null); continue; }
 
-        // Only grab items within 28pt of the absolute bottom — the true footer line
+        // Find the absolute lowest Y (PDF coords: 0=bottom) — that's the footer
         var minY = Infinity;
         items.forEach(function(it){ if (it.transform[5] < minY) minY = it.transform[5]; });
-        var botThresh = minY + 28; // ~28pt ≈ one text line height
-        var botItems  = items
-          .filter(function(it){ return it.transform[5] <= botThresh; })
-          .sort(function(a, b){
-            var dy = a.transform[5] - b.transform[5];
-            return dy !== 0 ? dy : a.transform[4] - b.transform[4];
-          });
+        // Only take items within 2pt of the very bottom line (strictly the footer row)
+        var botItems = items
+          .filter(function(it){ return it.transform[5] <= minY + 2; })
+          .sort(function(a, b){ return a.transform[4] - b.transform[4]; }); // left→right
 
         // Sliding-window join on bottom items (catches split labels like "3" "-" "5")
         outer:
