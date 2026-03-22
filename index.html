@@ -652,12 +652,15 @@
       var nL = ni > 0 ? lp(assigned[ni]) : null;
       var guess = null;
       if (pL && nL && pL.ch === nL.ch) {
+        // Same chapter: linear interpolation between the two anchors
         var gpg = Math.round(pL.pg + (i - pi) * (nL.pg - pL.pg) / (ni - pi));
         guess = pL.ch + '-' + gpg;
-      } else if (pL) {
-        guess = pL.ch + '-' + (pL.pg + (i - pi));
       } else if (nL) {
+        // Across a chapter boundary (or no prev): extrapolate backward from next anchor
         guess = nL.ch + '-' + Math.max(1, nL.pg - (ni - i));
+      } else if (pL) {
+        // No next anchor: extrapolate forward from prev
+        guess = pL.ch + '-' + (pL.pg + (i - pi));
       }
       if (guess) assigned[i] = guess;
     }
