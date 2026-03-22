@@ -588,6 +588,20 @@
     function lv(s) { var p=s.split('-'); return parseInt(p[0],10)*100000+parseInt(p[1],10); }
     function lp(s) { var p=s.split('-'); return { ch:parseInt(p[0],10), pg:parseInt(p[1],10) }; }
 
+    // Check localStorage cache — keyed by page count so it busts if the PDF changes
+    var CACHE_KEY = 'cbr-labels-v1-n' + pdfDoc.numPages;
+    try {
+      var cached = localStorage.getItem(CACHE_KEY);
+      if (cached) {
+        var assigned = JSON.parse(cached);
+        labelToPage.clear();
+        for (var i = 1; i <= pdfDoc.numPages; i++) {
+          if (assigned[i]) labelToPage.set(assigned[i], i);
+        }
+        return assigned;
+      }
+    } catch(_) {}
+
     // Phase 1: find the page label on each page
     // Strategy: ONLY look at the bottom 15% of the page (where page numbers live).
     // This stops cross-references in body text from poisoning the sequence.
@@ -670,6 +684,9 @@
     for (var i = 1; i <= pdfDoc.numPages; i++) {
       if (assigned[i]) labelToPage.set(assigned[i], i);
     }
+
+    // Save to localStorage so future loads skip scanning entirely
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify(assigned)); } catch(_) {}
 
     return assigned;
   }
