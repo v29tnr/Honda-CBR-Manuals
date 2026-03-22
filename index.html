@@ -582,112 +582,13 @@
 
   // ── Build a complete, globally-consistent page-label index ──────────────
   async function buildPageLabels() {
-    var dp      = '[-\u2013\u2011\u2012]';
-    var reExact = new RegExp('^\\d+' + dp + '\\d+$');
-    var norm    = function(s){ return s.replace(/[\u2013\u2011\u2012]/g, '-'); };
-    function lv(s) { var p=s.split('-'); return parseInt(p[0],10)*100000+parseInt(p[1],10); }
-    function lp(s) { var p=s.split('-'); return { ch:parseInt(p[0],10), pg:parseInt(p[1],10) }; }
-
-    // Check localStorage cache — keyed by page count so it busts if the PDF changes
-    var CACHE_KEY = 'cbr-labels-v2-n' + pdfDoc.numPages;
-    try {
-      var cached = localStorage.getItem(CACHE_KEY);
-      if (cached) {
-        var assigned = JSON.parse(cached);
-        labelToPage.clear();
-        for (var i = 1; i <= pdfDoc.numPages; i++) {
-          if (assigned[i]) labelToPage.set(assigned[i], i);
-        }
-        return assigned;
-      }
-    } catch(_) {}
-
-    // Phase 1: find the page label on each page
-    // Strategy: ONLY look at the bottom 15% of the page (where page numbers live).
-    // This stops cross-references in body text from poisoning the sequence.
-    var perPage = []; // perPage[i-1] = best label string or null
-    for (var i = 1; i <= pdfDoc.numPages; i++) {
-      loadingText.textContent = 'Indexing ' + i + '\u2009/\u2009' + pdfDoc.numPages;
-      var bestLabel = null;
-      try {
-        var pg    = await pdfDoc.getPage(i);
-        var tc    = await pg.getTextContent();
-        var items = tc.items.filter(function(it){ return it.str.trim().length > 0; });
-        if (items.length === 0) { perPage.push(null); continue; }
-
-        // Find the absolute lowest Y — scan with increasingly wide tolerance
-        // until we find a valid N-N pattern. This handles split footer items
-        // ("21" + "-1") without picking up index content above the footer.
-        var minY = Infinity;
-        items.forEach(function(it){ if (it.transform[5] < minY) minY = it.transform[5]; });
-
-        var tolerances = [0, 2, 6, 14];
-        outer2:
-        for (var ti = 0; ti < tolerances.length; ti++) {
-          var botItems = items
-            .filter(function(it){ return it.transform[5] <= minY + tolerances[ti]; })
-            .sort(function(a, b){ return a.transform[4] - b.transform[4]; }); // left→right
-          // Sliding-window join (catches split labels like "21" + "-" + "1")
-          for (var w = 1; w <= Math.min(6, botItems.length); w++) {
-            for (var j = 0; j + w <= botItems.length; j++) {
-              var cat = '';
-              for (var k = j; k < j+w; k++) cat += botItems[k].str;
-              cat = norm(cat.trim());
-              if (reExact.test(cat)) { bestLabel = cat; break outer2; }
-            }
-          }
-        }
-      } catch(_) {}
-      perPage.push(bestLabel);
-    }
-
-    // Phase 2: greedy forward pass — enforce strict monotone increase
-    var assigned = new Array(pdfDoc.numPages + 1).fill(null);
-    var lastVal = -1, lastStr = null;
-    for (var i = 1; i <= pdfDoc.numPages; i++) {
-      var s = perPage[i-1];
-      if (!s) continue;
-      var v = lv(s);
-      if (v <= lastVal) continue; // skip if it would break monotonicity
-      // Sanity: don't allow a jump of more than 2 chapters at once
-      if (lastStr && lp(s).ch - lp(lastStr).ch > 2) continue;
-      assigned[i] = s;
-      lastVal = v;
-      lastStr = s;
-    }
-
-    // Phase 3: linear interpolation for unlabelled pages
-    for (var i = 1; i <= pdfDoc.numPages; i++) {
-      if (assigned[i]) continue;
-      var pi = -1, ni = -1;
-      for (var j = i-1; j >= 1; j--)                { if (assigned[j]) { pi = j; break; } }
-      for (var j = i+1; j <= pdfDoc.numPages; j++)  { if (assigned[j]) { ni = j; break; } }
-      var pL = pi > 0 ? lp(assigned[pi]) : null;
-      var nL = ni > 0 ? lp(assigned[ni]) : null;
-      var guess = null;
-      if (pL && nL && pL.ch === nL.ch) {
-        // Same chapter: linear interpolation between the two anchors
-        var gpg = Math.round(pL.pg + (i - pi) * (nL.pg - pL.pg) / (ni - pi));
-        guess = pL.ch + '-' + gpg;
-      } else if (nL) {
-        // Across a chapter boundary (or no prev): extrapolate backward from next anchor
-        guess = nL.ch + '-' + Math.max(1, nL.pg - (ni - i));
-      } else if (pL) {
-        // No next anchor: extrapolate forward from prev
-        guess = pL.ch + '-' + (pL.pg + (i - pi));
-      }
-      if (guess) assigned[i] = guess;
-    }
-
-    // Phase 4: populate labelToPage (last writer wins for duplicates)
+    // Load pre-built index (generated offline from the PDF — instant, no scanning)
+    const resp = await fetch('page-labels.json');
+    const assigned = await resp.json(); // array[0]=null, array[1..n] = "ch-pg" or null
     labelToPage.clear();
-    for (var i = 1; i <= pdfDoc.numPages; i++) {
+    for (var i = 1; i < assigned.length; i++) {
       if (assigned[i]) labelToPage.set(assigned[i], i);
     }
-
-    // Save to localStorage so future loads skip scanning entirely
-    try { localStorage.setItem(CACHE_KEY, JSON.stringify(assigned)); } catch(_) {}
-
     return assigned;
   }
 
@@ -971,8 +872,7 @@
       pdfDoc = await task.promise;
       totalSpan.textContent = pdfDoc.numPages;
       pageInput.max = pdfDoc.numPages;
-      // Index all pages before showing viewer — fast (text only, no rendering)
-      loadingText.textContent = 'Indexing pages\u2026';
+      // Load pre-built page label index (instant fetch)
       const assigned = await buildPageLabels();
       await renderPage(1);
       overlay.style.display = 'none';
