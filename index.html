@@ -276,6 +276,31 @@
       user-select: none;
     }
 
+    /* In-viewport nav arrows flanking the book */
+    .vp-nav {
+      align-self: center;
+      flex-shrink: 0;
+      background: rgba(233,69,96,0.13);
+      color: var(--accent);
+      border: 1px solid rgba(233,69,96,0.28);
+      border-radius: 8px;
+      font-size: 1.6rem;
+      line-height: 1;
+      padding: 0.8rem 0.5rem;
+      cursor: pointer;
+      transition: background .18s;
+    }
+    .vp-nav:hover:not(:disabled) { background: rgba(233,69,96,0.42); opacity: 1; }
+    .vp-nav:disabled { background: rgba(30,30,60,0.4); opacity: 0.18; cursor: default; }
+
+    /* Highlight overlay — sits directly over the PDF canvas */
+    #highlightCanvas {
+      position: absolute;
+      top: 0; left: 0;
+      pointer-events: none;
+      border-radius: 0 3px 3px 0;
+    }
+
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: #111; }
     ::-webkit-scrollbar-thumb { background: #2a2a4a; border-radius: 3px; }
@@ -328,9 +353,12 @@
 <div id="main">
   <div id="sidebar"></div>
   <div id="viewport">
+    <button class="vp-nav" id="vpPrevBtn" disabled>&#8592;</button>
     <div id="bookWrapper">
       <canvas id="pdfCanvas"></canvas>
+      <canvas id="highlightCanvas"></canvas>
     </div>
+    <button class="vp-nav" id="vpNextBtn" disabled>&#8594;</button>
   </div>
 </div>
 
@@ -350,12 +378,12 @@
   let currentScale  = 'auto';
   let sidebarVisible = true;
   let searchIndexed  = false;
-  let activeRender   = null;
-  const textIndex    = new Map();
+  let activeRender   = null;  let highlightQuery = null;  const textIndex    = new Map();
 
-  const canvas        = document.getElementById('pdfCanvas');
-  const ctx           = canvas.getContext('2d');
-  const prevBtn       = document.getElementById('prevBtn');
+  const canvas          = document.getElementById('pdfCanvas');
+  const ctx             = canvas.getContext('2d');
+  const highlightCanvas = document.getElementById('highlightCanvas');
+  const prevBtn         = document.getElementById('prevBtn');
   const nextBtn       = document.getElementById('nextBtn');
   const pageInput     = document.getElementById('pageInput');
   const totalSpan     = document.getElementById('totalPages');
@@ -378,7 +406,7 @@
     const availH = viewport_el.clientHeight - pad;
     switch (currentScale) {
       case 'auto': return land
-        ? Math.min(availW / raw.width, availH / raw.height)
+        ? availH / raw.height
         : availW / raw.width;
       case 'fitw': return availW / raw.width;
       case 'fith': return availH / raw.height;
@@ -402,6 +430,15 @@
     catch (e) { if (e && e.name !== 'RenderingCancelledException') console.warn(e); return; }
     activeRender = null;
 
+    // Sync highlight overlay size and redraw
+    highlightCanvas.width  = canvas.width;
+    highlightCanvas.height = canvas.height;
+    if (highlightQuery) {
+      drawHighlights(page, highlightQuery, vp);
+    } else {
+      highlightCanvas.getContext('2d').clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
+    }
+
     // scroll only the viewport panel, not the window
     viewport_el.scrollTop  = 0;
     viewport_el.scrollLeft = 0;
@@ -410,6 +447,8 @@
     pageInput.value  = num;
     prevBtn.disabled = num <= 1;
     nextBtn.disabled = num >= pdfDoc.numPages;
+    document.getElementById('vpPrevBtn').disabled = num <= 1;
+    document.getElementById('vpNextBtn').disabled = num >= pdfDoc.numPages;
     scrollThumbIntoView(num);
   }
 
@@ -427,6 +466,35 @@
     else if (bottom > visBot) sidebar.scrollTop = bottom - sidebar.clientHeight + 6;
   }
 
+  // Draw yellow highlight boxes over text items matching query
+  async function drawHighlights(page, query, vp) {
+    const hctx = highlightCanvas.getContext('2d');
+    hctx.clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
+    if (!query) return;
+    var tc;
+    try { tc = await page.getTextContent(); } catch(e) { return; }
+    var queryLow = query.toLowerCase();
+    var vt = vp.transform; // [a, b, c, d, tx, ty]
+    hctx.fillStyle = 'rgba(255, 210, 0, 0.45)';
+    hctx.strokeStyle = 'rgba(220, 140, 0, 0.6)';
+    hctx.lineWidth = 1;
+    tc.items.forEach(function(item) {
+      if (!item.str || !item.str.toLowerCase().includes(queryLow)) return;
+      var e = item.transform[4], f = item.transform[5];
+      var w = item.width, h = item.height;
+      // Map PDF-space rect corners to canvas coords
+      var cx_bl = vt[0]*e       + vt[2]*f       + vt[4];
+      var cy_bl = vt[1]*e       + vt[3]*f       + vt[5];
+      var cx_tr = vt[0]*(e+w)   + vt[2]*(f+h)   + vt[4];
+      var cy_tr = vt[1]*(e+w)   + vt[3]*(f+h)   + vt[5];
+      var rx = Math.min(cx_bl, cx_tr);
+      var ry = Math.min(cy_bl, cy_tr);
+      var rw = Math.abs(cx_tr - cx_bl);
+      var rh = Math.abs(cy_tr - cy_bl);
+      if (rw > 0 && rh > 0) { hctx.fillRect(rx, ry, rw, rh); hctx.strokeRect(rx, ry, rw, rh); }
+    });
+  }
+
   async function buildThumbs() {
     for (let i = 1; i <= pdfDoc.numPages; i++) {
       const page = await pdfDoc.getPage(i);
@@ -442,7 +510,7 @@
       label.textContent = i;
       item.appendChild(c);
       item.appendChild(label);
-      item.addEventListener('click', () => renderPage(i));
+      item.addEventListener('click', () => { highlightQuery = null; renderPage(i); });
       sidebar.appendChild(item);
       loadingText.textContent = 'Thumbnails ' + i + '/' + pdfDoc.numPages;
     }
@@ -495,6 +563,7 @@
       div.className = 'sr';
       div.innerHTML = '<span class="pn">Page ' + m.pageNum + '</span><span class="snip">' + m.snip + '</span>';
       div.addEventListener('click', function() {
+        highlightQuery = raw;
         renderPage(m.pageNum);
         searchPanel.classList.remove('open');
       });
@@ -521,8 +590,8 @@
     }
   })();
 
-  function prevPage() { if (currentPage > 1) renderPage(currentPage - 1); }
-  function nextPage() { if (pdfDoc && currentPage < pdfDoc.numPages) renderPage(currentPage + 1); }
+  function prevPage() { if (currentPage > 1) { highlightQuery = null; renderPage(currentPage - 1); } }
+  function nextPage() { if (pdfDoc && currentPage < pdfDoc.numPages) { highlightQuery = null; renderPage(currentPage + 1); } }
 
   prevBtn.addEventListener('click', prevPage);
   nextBtn.addEventListener('click', nextPage);
@@ -573,6 +642,9 @@
     var prev = STEPS.slice().reverse().find(function(v){ return v < cur; }) || STEPS[0];
     setZoom(String(prev));
   });
+
+  document.getElementById('vpPrevBtn').addEventListener('click', prevPage);
+  document.getElementById('vpNextBtn').addEventListener('click', nextPage);
 
   document.getElementById('sidebarToggle').addEventListener('click', function() {
     sidebarVisible = !sidebarVisible;
