@@ -601,18 +601,13 @@
         var items = tc.items.filter(function(it){ return it.str.trim().length > 0; });
         if (items.length === 0) { perPage.push(null); continue; }
 
-        // Determine bottom-zone threshold (lowest 8% of page height)
-        var minY = Infinity, maxY = -Infinity;
-        items.forEach(function(it){
-          var y = it.transform[5];
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
-        });
-        var botThresh = minY + (maxY - minY) * 0.08;
+        // Only grab items within 28pt of the absolute bottom — the true footer line
+        var minY = Infinity;
+        items.forEach(function(it){ if (it.transform[5] < minY) minY = it.transform[5]; });
+        var botThresh = minY + 28; // ~28pt ≈ one text line height
         var botItems  = items
           .filter(function(it){ return it.transform[5] <= botThresh; })
           .sort(function(a, b){
-            // Sort by Y ascending (lowest first), then X ascending for ties
             var dy = a.transform[5] - b.transform[5];
             return dy !== 0 ? dy : a.transform[4] - b.transform[4];
           });
