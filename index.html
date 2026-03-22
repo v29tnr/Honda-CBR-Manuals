@@ -601,22 +601,26 @@
         var items = tc.items.filter(function(it){ return it.str.trim().length > 0; });
         if (items.length === 0) { perPage.push(null); continue; }
 
-        // Find the absolute lowest Y (PDF coords: 0=bottom) — that's the footer
+        // Find the absolute lowest Y — scan with increasingly wide tolerance
+        // until we find a valid N-N pattern. This handles split footer items
+        // ("21" + "-1") without picking up index content above the footer.
         var minY = Infinity;
         items.forEach(function(it){ if (it.transform[5] < minY) minY = it.transform[5]; });
-        // Only take items within 2pt of the very bottom line (strictly the footer row)
-        var botItems = items
-          .filter(function(it){ return it.transform[5] <= minY + 2; })
-          .sort(function(a, b){ return a.transform[4] - b.transform[4]; }); // left→right
 
-        // Sliding-window join on bottom items (catches split labels like "3" "-" "5")
-        outer:
-        for (var w = 1; w <= Math.min(6, botItems.length); w++) {
-          for (var j = 0; j + w <= botItems.length; j++) {
-            var cat = '';
-            for (var k = j; k < j+w; k++) cat += botItems[k].str;
-            cat = norm(cat.trim());
-            if (reExact.test(cat)) { bestLabel = cat; break outer; }
+        var tolerances = [0, 2, 6, 14];
+        outer2:
+        for (var ti = 0; ti < tolerances.length; ti++) {
+          var botItems = items
+            .filter(function(it){ return it.transform[5] <= minY + tolerances[ti]; })
+            .sort(function(a, b){ return a.transform[4] - b.transform[4]; }); // left→right
+          // Sliding-window join (catches split labels like "21" + "-" + "1")
+          for (var w = 1; w <= Math.min(6, botItems.length); w++) {
+            for (var j = 0; j + w <= botItems.length; j++) {
+              var cat = '';
+              for (var k = j; k < j+w; k++) cat += botItems[k].str;
+              cat = norm(cat.trim());
+              if (reExact.test(cat)) { bestLabel = cat; break outer2; }
+            }
           }
         }
       } catch(_) {}
