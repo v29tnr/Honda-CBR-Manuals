@@ -176,8 +176,8 @@
       gap: 0.4rem;
     }
     #sidebar::-webkit-scrollbar { width: 4px; }
-    #sidebar::-webkit-scrollbar-track { background: transparent; }
-    #sidebar::-webkit-scrollbar-thumb { background: #2a2a4a; border-radius: 2px; }
+    #sidebar::-webkit-scrollbar-track { background: #0d0d1f; }
+    #sidebar::-webkit-scrollbar-thumb { background: #5a5a8a; border-radius: 2px; }
 
     .thumb-item {
       cursor: pointer;
@@ -301,9 +301,50 @@
       border-radius: 0 3px 3px 0;
     }
 
+    /* TOC panel */
+    #tocPanel {
+      position: fixed;
+      top: var(--header-h);
+      left: 0; right: 0;
+      background: var(--panel);
+      border-bottom: 2px solid var(--accent);
+      padding: 0.55rem 0.9rem;
+      display: none;
+      flex-direction: column;
+      gap: 0.35rem;
+      z-index: 60;
+      max-height: 70vh;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+    #tocPanel.open { display: flex; }
+    #tocStatus { font-size: 0.76rem; color: var(--muted); }
+    #tocResults {
+      overflow-y: auto;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 0.22rem;
+    }
+    .toc-item {
+      background: #0d0d1f;
+      border: 1px solid #252545;
+      border-radius: 4px;
+      padding: 0.32rem 0.55rem;
+      cursor: pointer;
+      font-size: 0.8rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.5rem;
+      transition: border-color .15s;
+    }
+    .toc-item:hover { border-color: var(--accent); }
+    .toc-name { color: var(--text); flex: 1; }
+    .toc-ref  { color: var(--accent); font-weight: 700; font-size: 0.73rem; white-space: nowrap; }
+
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: #111; }
-    ::-webkit-scrollbar-thumb { background: #2a2a4a; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb { background: #5a5a8a; border-radius: 3px; }
   </style>
 </head>
 <body>
@@ -318,6 +359,7 @@
   <div class="sep"></div>
   <button class="icon-btn" id="sidebarToggle" title="Toggle page list">&#9776;</button>
   <button class="icon-btn" id="searchToggle"  title="Search text">&#128269;</button>
+  <button class="icon-btn" id="tocToggle"     title="Table of Contents">&#128195;</button>
   <div class="sep"></div>
   <button id="prevBtn" disabled>&#8592;</button>
   <div class="page-info">
@@ -350,6 +392,11 @@
   <div id="searchResults"></div>
 </div>
 
+<div id="tocPanel">
+  <div id="tocStatus">Building contents…</div>
+  <div id="tocResults"></div>
+</div>
+
 <div id="main">
   <div id="sidebar"></div>
   <div id="viewport">
@@ -378,7 +425,10 @@
   let currentScale  = 'auto';
   let sidebarVisible = true;
   let searchIndexed  = false;
-  let activeRender   = null;  let highlightQuery = null;  const textIndex    = new Map();
+  let activeRender   = null;
+  let highlightQuery = null;
+  const textIndex    = new Map();
+  const labelToPage  = new Map(); // "1-1" -> PDF page index
 
   const canvas          = document.getElementById('pdfCanvas');
   const ctx             = canvas.getContext('2d');
@@ -399,16 +449,15 @@
 
   // Auto: landscape = fit inside viewport (no scroll), portrait = fit width
   function computeScale(page) {
-    const raw  = page.getViewport({ scale: 1 });
-    const land = raw.width > raw.height;
-    const pad  = 32;
+    const raw    = page.getViewport({ scale: 1 });
+    const pad    = 32;
     const availW = viewport_el.clientWidth  - pad;
     const availH = viewport_el.clientHeight - pad;
+    // Subtract nav button widths (~50px each) from available width
+    const availWBook = availW - 110;
     switch (currentScale) {
-      case 'auto': return land
-        ? availH / raw.height
-        : availW / raw.width;
-      case 'fitw': return availW / raw.width;
+      case 'auto': return Math.min(availWBook / raw.width, availH / raw.height);
+      case 'fitw': return availWBook / raw.width;
       case 'fith': return availH / raw.height;
       default:     return parseFloat(currentScale);
     }
@@ -503,17 +552,81 @@
       c.width = vp.width; c.height = vp.height;
       await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
 
+      // Extract manual page label e.g. "2-3" — typically the last N-N text item on the page
+      var pageLabel = String(i);
+      try {
+        var tc2 = await page.getTextContent();
+        var lr = /^\d+-\d+$/;
+        var found = tc2.items.map(function(it){ return it.str.trim(); }).filter(function(s){ return lr.test(s); });
+        if (found.length > 0) { pageLabel = found[found.length - 1]; labelToPage.set(pageLabel, i); }
+      } catch(_) {}
+
       const item  = document.createElement('div');
       item.className = 'thumb-item' + (i === 1 ? ' active' : '');
       const label = document.createElement('div');
       label.className = 'thumb-label';
-      label.textContent = i;
+      label.textContent = pageLabel;
       item.appendChild(c);
       item.appendChild(label);
       item.addEventListener('click', () => { highlightQuery = null; renderPage(i); });
       sidebar.appendChild(item);
       loadingText.textContent = 'Thumbnails ' + i + '/' + pdfDoc.numPages;
     }
+  }
+
+  async function buildTOC() {
+    var n = pdfDoc.numPages;
+    var refRe = /^\d+-\d+$/;
+    var entries = [];
+
+    for (var pi = 0; pi < 2; pi++) {
+      var pageNum = n - 1 + pi; // last 2 pages
+      var page = await pdfDoc.getPage(pageNum);
+      var tc;
+      try { tc = await page.getTextContent(); } catch(_) { continue; }
+
+      // Group items by rounded y-coordinate to reconstruct text lines
+      var lines = new Map();
+      tc.items.forEach(function(it) {
+        if (!it.str.trim()) return;
+        var y = Math.round(it.transform[5] / 3) * 3;
+        if (!lines.has(y)) lines.set(y, []);
+        lines.get(y).push(it);
+      });
+
+      // Sort y descending (PDF y=0 is bottom of page = highest y is top of page)
+      var ys = Array.from(lines.keys()).sort(function(a, b) { return b - a; });
+      ys.forEach(function(y) {
+        var items = lines.get(y).sort(function(a, b) { return a.transform[4] - b.transform[4]; });
+        var last = items[items.length - 1];
+        if (!last || !refRe.test(last.str.trim())) return;
+        var ref = last.str.trim();
+        var nameItems = items.slice(0, -1);
+        // Join, strip trailing dots/spaces (used as leaders in index)
+        var name = nameItems.map(function(it){ return it.str; }).join('').replace(/[.\s]+$/, '').trim();
+        if (!name) name = nameItems.map(function(it){ return it.str; }).join(' ').trim();
+        if (name.length < 2) return;
+        var target = labelToPage.get(ref);
+        if (!target) return;
+        entries.push({ name: name, ref: ref, page: target });
+      });
+    }
+
+    var tocStatus  = document.getElementById('tocStatus');
+    var tocResults = document.getElementById('tocResults');
+    if (entries.length === 0) { tocStatus.textContent = 'No index entries found on last 2 pages.'; return; }
+    tocStatus.textContent = entries.length + ' sections';
+    tocResults.innerHTML = '';
+    entries.forEach(function(entry) {
+      var div = document.createElement('div');
+      div.className = 'toc-item';
+      div.innerHTML = '<span class="toc-name">' + entry.name + '</span><span class="toc-ref">' + entry.ref + '</span>';
+      div.addEventListener('click', function() {
+        renderPage(entry.page);
+        document.getElementById('tocPanel').classList.remove('open');
+      });
+      tocResults.appendChild(div);
+    });
   }
 
   async function buildTextIndex() {
@@ -582,7 +695,7 @@
       pageInput.max = pdfDoc.numPages;
       await renderPage(1);
       overlay.style.display = 'none';
-      buildThumbs();
+      buildThumbs().then(buildTOC);
       buildTextIndex();
     } catch(err) {
       loadingText.textContent = 'Failed to load PDF. Make sure F3manual.pdf is in the same folder.';
@@ -653,15 +766,22 @@
   });
 
   document.getElementById('searchToggle').addEventListener('click', function() {
+    document.getElementById('tocPanel').classList.remove('open');
     searchPanel.classList.toggle('open');
     if (searchPanel.classList.contains('open')) searchInput.focus();
   });
   document.getElementById('searchBtn').addEventListener('click', doSearch);
   searchInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') doSearch(); });
+  document.getElementById('tocToggle').addEventListener('click', function() {
+    searchPanel.classList.remove('open');
+    document.getElementById('tocPanel').classList.toggle('open');
+  });
   document.addEventListener('click', function(e) {
-    if (!searchPanel.contains(e.target) && e.target.id !== 'searchToggle') {
-      searchPanel.classList.remove('open');
-    }
+    var inSearch = searchPanel.contains(e.target) || e.target.id === 'searchToggle';
+    var inToc    = document.getElementById('tocPanel').contains(e.target) || e.target.id === 'tocToggle';
+    if (!inSearch && !inToc) { searchPanel.classList.remove('open'); document.getElementById('tocPanel').classList.remove('open'); }
+    else if (!inSearch) { searchPanel.classList.remove('open'); }
+    else if (!inToc)    { document.getElementById('tocPanel').classList.remove('open'); }
   });
 
   var rTimer;
