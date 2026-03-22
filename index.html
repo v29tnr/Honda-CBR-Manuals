@@ -589,7 +589,7 @@
     function lp(s) { var p=s.split('-'); return { ch:parseInt(p[0],10), pg:parseInt(p[1],10) }; }
 
     // Check localStorage cache — keyed by page count so it busts if the PDF changes
-    var CACHE_KEY = 'cbr-labels-v1-n' + pdfDoc.numPages;
+    var CACHE_KEY = 'cbr-labels-v2-n' + pdfDoc.numPages;
     try {
       var cached = localStorage.getItem(CACHE_KEY);
       if (cached) {
