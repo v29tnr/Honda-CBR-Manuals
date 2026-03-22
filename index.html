@@ -481,12 +481,15 @@
     var isMobile = window.matchMedia('(pointer: coarse), (max-width: 600px)').matches;
     var navW = isMobile ? 0 : 110;
     const availWBook = availW - navW;
+    var s;
     switch (currentScale) {
-      case 'auto': return Math.min(availWBook / raw.width, availH / raw.height);
-      case 'fitw': return availWBook / raw.width;
-      case 'fith': return availH / raw.height;
-      default:     return parseFloat(currentScale);
+      case 'auto': s = Math.min(availWBook / raw.width, availH / raw.height); break;
+      case 'fitw': s = availWBook / raw.width; break;
+      case 'fith': s = availH / raw.height; break;
+      default:     s = parseFloat(currentScale);
     }
+    computeScale._lastAuto = s;
+    return s;
   }
 
   async function renderPage(num) {
@@ -899,17 +902,83 @@
     else if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); prevPage(); }
   });
 
-  // Swipe — only triggers on clear horizontal swipe; vertical scroll still works
-  var tx = 0, ty = 0;
+  // ── Touch handling: pinch-zoom + smart swipe ─────────────────────────────
+  // • 1 finger zoomed in  → native scroll/pan (no interference)
+  // • 1 finger at zoom 1  → horizontal swipe turns page
+  // • 2 fingers           → pinch-zoom
+  var _t0x = 0, _t0y = 0, _pinchDist0 = 0, _pinchScale0 = 1, _isPinch = false;
+
+  function _touches2dist(e) {
+    var dx = e.touches[0].clientX - e.touches[1].clientX;
+    var dy = e.touches[0].clientY - e.touches[1].clientY;
+    return Math.sqrt(dx*dx + dy*dy);
+  }
+
+  function _isZoomedIn() {
+    // Canvas is physically wider than the viewport's scrollable content area
+    return canvas.offsetWidth > viewport_el.clientWidth ||
+           canvas.offsetHeight > viewport_el.clientHeight;
+  }
+
+  function _atScrollEdge(dx) {
+    var sl = viewport_el.scrollLeft;
+    var maxSL = viewport_el.scrollWidth - viewport_el.clientWidth;
+    if (dx > 0) return sl >= maxSL - 2; // swiping left → next page → must be at right edge
+    if (dx < 0) return sl <= 2;         // swiping right → prev page → must be at left edge
+    return false;
+  }
+
   viewport_el.addEventListener('touchstart', function(e) {
-    tx = e.touches[0].clientX; ty = e.touches[0].clientY;
-  }, { passive: true });
-  viewport_el.addEventListener('touchend', function(e) {
-    var dx = tx - e.changedTouches[0].clientX;
-    var dy = ty - e.changedTouches[0].clientY;
-    if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 48) {
-      if (dx > 0) { nextPage(); flash('R'); } else { prevPage(); flash('L'); }
+    _isPinch = e.touches.length >= 2;
+    if (_isPinch) {
+      _pinchDist0  = _touches2dist(e);
+      _pinchScale0 = AUTOMODES.has(currentScale) ? computeScale._lastAuto || 1 : parseFloat(currentScale);
+      e.preventDefault();
+    } else {
+      _t0x = e.touches[0].clientX;
+      _t0y = e.touches[0].clientY;
     }
+  }, { passive: false });
+
+  viewport_el.addEventListener('touchmove', function(e) {
+    if (e.touches.length >= 2) {
+      _isPinch = true;
+      var dist = _touches2dist(e);
+      if (_pinchDist0 < 1) return;
+      var raw = _pinchScale0 * (dist / _pinchDist0);
+      var clamped = Math.min(Math.max(raw, 0.25), 5);
+      // Apply live without re-rendering on every frame — just scale CSS
+      canvas.style.width         = (canvas.width  / (window.devicePixelRatio || 1) * (clamped / _pinchScale0)) + 'px';
+      canvas.style.height        = (canvas.height / (window.devicePixelRatio || 1) * (clamped / _pinchScale0)) + 'px';
+      highlightCanvas.style.width  = canvas.style.width;
+      highlightCanvas.style.height = canvas.style.height;
+      e.preventDefault();
+    }
+  }, { passive: false });
+
+  viewport_el.addEventListener('touchend', function(e) {
+    if (_isPinch && e.touches.length < 2) {
+      // Commit pinch zoom: measure the CSS size we landed on vs the DPR-adjusted natural size
+      var naturalW = canvas.width / (window.devicePixelRatio || 1);
+      var cssW     = parseFloat(canvas.style.width) || naturalW;
+      var ratio    = cssW / naturalW;
+      // Compute what actual PDF scale that corresponds to
+      _pinchScale0 = _pinchScale0; // keep for next gesture
+      var newScale = _pinchScale0 * ratio;
+      newScale = Math.min(Math.max(newScale, 0.25), 5);
+      setZoom(String(Math.round(newScale * 100) / 100));
+      _isPinch = false;
+      return;
+    }
+    _isPinch = false;
+
+    // Single-finger swipe → only navigate if not zoomed in, OR if zoomed and at scroll edge
+    var dx = _t0x - e.changedTouches[0].clientX;
+    var dy = _t0y - e.changedTouches[0].clientY;
+    var isHoriz = Math.abs(dx) > Math.abs(dy) * 1.5 && Math.abs(dx) > 52;
+    if (!isHoriz) return;
+    if (_isZoomedIn() && !_atScrollEdge(dx)) return; // panning, not turning
+    if (dx > 0) { nextPage(); flash('R'); } else { prevPage(); flash('L'); }
   }, { passive: true });
 
   function flash(dir) {
