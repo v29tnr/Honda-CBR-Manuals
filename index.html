@@ -959,7 +959,8 @@
       const assigned = await buildPageLabels();
       await renderPage(1);
       overlay.style.display = 'none';
-      buildThumbs(assigned).then(buildTOC);
+      buildTOC();          // instant — labelToPage is already populated
+      buildThumbs(assigned);
       buildTextIndex();
     } catch(err) {
       loadingText.textContent = 'Failed to load PDF. Make sure F3manual.pdf is in the same folder.';
