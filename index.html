@@ -342,6 +342,9 @@
     .toc-name { color: var(--text); flex: 1; }
     .toc-ref  { color: var(--accent); font-weight: 700; font-size: 0.73rem; white-space: nowrap; }
 
+    .toc-item.toc-sub { border-left: 2px solid #333366; }
+    .toc-item.toc-sub .toc-name { padding-left: 1rem; font-size: 0.74rem; color: var(--muted); }
+
     ::-webkit-scrollbar { width: 6px; height: 6px; }
     ::-webkit-scrollbar-track { background: #111; }
     ::-webkit-scrollbar-thumb { background: #5a5a8a; border-radius: 3px; }
@@ -575,51 +578,75 @@
   }
 
   async function buildTOC() {
-    var n = pdfDoc.numPages;
-    var refRe = /^\d+-\d+$/;
+    var n      = pdfDoc.numPages;
+    var refRe  = /^\d+-\d+$/;
     var entries = [];
 
     for (var pi = 0; pi < 2; pi++) {
-      var pageNum = n - 1 + pi; // last 2 pages
-      var page = await pdfDoc.getPage(pageNum);
+      var pageNum = n - 1 + pi;
+      var page    = await pdfDoc.getPage(pageNum);
+      var vp0     = page.getViewport({ scale: 1 });
       var tc;
       try { tc = await page.getTextContent(); } catch(_) { continue; }
 
-      // Group items by rounded y-coordinate to reconstruct text lines
-      var lines = new Map();
+      // Split into left / right columns at the page midpoint
+      var colSplit  = vp0.width / 2;
+      var leftXs    = tc.items.filter(function(it){ return it.str.trim() && it.transform[4] < colSplit; }).map(function(it){ return it.transform[4]; });
+      var rightXs   = tc.items.filter(function(it){ return it.str.trim() && it.transform[4] >= colSplit; }).map(function(it){ return it.transform[4]; });
+      var leftBase  = leftXs.length  ? Math.min.apply(null, leftXs)  : 0;
+      var rightBase = rightXs.length ? Math.min.apply(null, rightXs) : 0;
+
+      // Group into lines by y (tolerance ±2 pt)
+      var lineMap = new Map();
       tc.items.forEach(function(it) {
         if (!it.str.trim()) return;
-        var y = Math.round(it.transform[5] / 3) * 3;
-        if (!lines.has(y)) lines.set(y, []);
-        lines.get(y).push(it);
+        var y = Math.round(it.transform[5] / 2) * 2;
+        if (!lineMap.has(y)) lineMap.set(y, []);
+        lineMap.get(y).push(it);
       });
 
-      // Sort y descending (PDF y=0 is bottom of page = highest y is top of page)
-      var ys = Array.from(lines.keys()).sort(function(a, b) { return b - a; });
+      function parseLine(items, baseX) {
+        items = items.slice().sort(function(a, b) { return a.transform[4] - b.transform[4]; });
+        // Find rightmost N-N page ref
+        var refIdx = -1;
+        for (var j = items.length - 1; j >= 0; j--) {
+          if (refRe.test(items[j].str.trim())) { refIdx = j; break; }
+        }
+        if (refIdx < 0) return null;
+        var ref  = items[refIdx].str.trim();
+        // Name: join items before ref, strip dot leaders (... sequences) and extra spaces
+        var raw  = items.slice(0, refIdx).map(function(it){ return it.str; }).join('');
+        var name = raw.replace(/\.{2,}/g, '').replace(/\s+/g, ' ').trim();
+        if (name.length < 2) return null;
+        var target   = labelToPage.get(ref);
+        if (!target) return null;
+        var indented = (items[0].transform[4] - baseX) > 8;
+        return { name: name, ref: ref, page: target, indented: indented };
+      }
+
+      // Process lines top-to-bottom (highest y first in PDF space)
+      var ys = Array.from(lineMap.keys()).sort(function(a, b) { return b - a; });
       ys.forEach(function(y) {
-        var items = lines.get(y).sort(function(a, b) { return a.transform[4] - b.transform[4]; });
-        var last = items[items.length - 1];
-        if (!last || !refRe.test(last.str.trim())) return;
-        var ref = last.str.trim();
-        var nameItems = items.slice(0, -1);
-        // Join, strip trailing dots/spaces (used as leaders in index)
-        var name = nameItems.map(function(it){ return it.str; }).join('').replace(/[.\s]+$/, '').trim();
-        if (!name) name = nameItems.map(function(it){ return it.str; }).join(' ').trim();
-        if (name.length < 2) return;
-        var target = labelToPage.get(ref);
-        if (!target) return;
-        entries.push({ name: name, ref: ref, page: target });
+        var all   = lineMap.get(y);
+        var left  = all.filter(function(it){ return it.transform[4] <  colSplit; });
+        var right = all.filter(function(it){ return it.transform[4] >= colSplit; });
+        var r;
+        if (left.length)  { r = parseLine(left,  leftBase);  if (r) entries.push(r); }
+        if (right.length) { r = parseLine(right, rightBase); if (r) entries.push(r); }
       });
     }
+
+    // Sort by page number for logical navigation order
+    entries.sort(function(a, b) { return a.page - b.page; });
 
     var tocStatus  = document.getElementById('tocStatus');
     var tocResults = document.getElementById('tocResults');
     if (entries.length === 0) { tocStatus.textContent = 'No index entries found on last 2 pages.'; return; }
-    tocStatus.textContent = entries.length + ' sections';
+    tocStatus.textContent = entries.length + ' entries';
     tocResults.innerHTML = '';
     entries.forEach(function(entry) {
       var div = document.createElement('div');
-      div.className = 'toc-item';
+      div.className = 'toc-item' + (entry.indented ? ' toc-sub' : '');
       div.innerHTML = '<span class="toc-name">' + entry.name + '</span><span class="toc-ref">' + entry.ref + '</span>';
       div.addEventListener('click', function() {
         renderPage(entry.page);
